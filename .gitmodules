@@ -1,3 +1,6 @@
 [submodule "Varjo-SDK"]
 	path = Varjo-SDK
 	url = https://github.com/mbucchia/Varjo-SDK.git
+[submodule "Detours"]
+	path = Detours
+	url = https://github.com/microsoft/Detours.git
