@@ -37,6 +37,8 @@ add_executable(SKOverlayApp
   ${DETOURS_SRC}
 )
 
+target_compile_features(SKOverlayApp PRIVATE cxx_std_17)
+
 # Link to dependencies
 target_link_libraries(SKOverlayApp
   PRIVATE StereoKitC VarjoLib

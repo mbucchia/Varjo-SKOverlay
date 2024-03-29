@@ -31,6 +31,7 @@ using Microsoft::WRL::ComPtr;
 #include <d3d11.h>
 #include <Varjo.h>
 #include <detours.h>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -289,11 +290,11 @@ int main(void) {
         return 1;
 
     // Hook the Varjo runtime to force overlay mode.
-    // TODO: Use appropriate path.
-    DetourDllAttach("C:\\Program Files\\Varjo\\varjo-openxr\\VarjoLib.dll",
-                    "varjo_WaitSync",
-                    hooked_varjo_WaitSync,
-                    original_varjo_WaitSync);
+    const std::filesystem::path varjoLib =
+        std::filesystem::path(Utils::RegGetString(HKEY_LOCAL_MACHINE, "SOFTWARE\\Varjo\\Runtime", "InstallDir")
+                                  .value_or(L"C:\\Program Files\\Varjo")) /
+        L"varjo-openxr" / L"VarjoLib.dll";
+    Utils::DetourDllAttach(varjoLib.c_str(), "varjo_WaitSync", hooked_varjo_WaitSync, original_varjo_WaitSync);
 
     // Disable skybox to ensure a transparent background.
     render_enable_skytex(false);
