@@ -25,10 +25,13 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <wrl.h>
+using Microsoft::WRL::ComPtr;
 #include <winuser.h>
 #include <d3d11.h>
 #include <Varjo.h>
 #include <detours.h>
+#include <string>
 #include <vector>
 
 #include <stereokit.h>
@@ -37,197 +40,243 @@ using namespace sk;
 
 #include "utils.h"
 
-void (*original_varjo_WaitSync)(struct varjo_Session* session, struct varjo_FrameInfo* frameInfo) = nullptr;
-void hooked_varjo_WaitSync(struct varjo_Session* session, struct varjo_FrameInfo* frameInfo) {
-    // Keep the session as an overlay.
-    varjo_SessionSetPriority(session, 1000);
+namespace {
 
-    return original_varjo_WaitSync(session, frameInfo);
-}
+    // TODO: Replace me with WinRT Capture.
+    BOOL(WINAPI* DwmGetDxSharedSurface)
+    (HANDLE hHandle,
+     HANDLE* phSurface,
+     LUID* pAdapterLuid,
+     ULONG* pFmtWindow,
+     ULONG* pPresentFlags,
+     ULONGLONG* pWin32kUpdateId) = nullptr;
 
-mesh_t mirror_mesh;
-ID3D11Device* mirror_device;
+    // Hook the Varjo SDK (used by the OpenXR runtime) to keep the session as an overlay.
+    void (*original_varjo_WaitSync)(struct varjo_Session* session, struct varjo_FrameInfo* frameInfo) = nullptr;
+    void hooked_varjo_WaitSync(struct varjo_Session* session, struct varjo_FrameInfo* frameInfo) {
+        varjo_SessionSetPriority(session, 1000);
 
-struct window_t {
-    HWND window;
-    ID3D11Texture2D* shared_texture;
-    tex_t texture;
-    material_t material;
-    pose_t pose;
-    char name[128];
-    float scale;
-    bool decorate;
-};
-std::vector<window_t> mirror_windows;
-
-struct available_window_t {
-    HWND window;
-    char name[128];
-    bool32_t mirrored;
-    bool32_t was_mirrored;
-};
-std::vector<available_window_t> available_windows;
-
-// TODO: Replace me with WinRT Capture.
-typedef BOOL(WINAPI* fn_GetDxSharedSurface)(HANDLE hHandle,
-                                            HANDLE* phSurface,
-                                            LUID* pAdapterLuid,
-                                            ULONG* pFmtWindow,
-                                            ULONG* pPresentFlags,
-                                            ULONGLONG* pWin32kUpdateId);
-fn_GetDxSharedSurface DwmGetDxSharedSurface;
-
-void step(void) {
-    static pose_t window_pose = pose_t{{0, 0, -0.5f}, quat_lookat(vec3_zero, {0, 0, 1})};
-
-    ui_window_begin("Window Selection", window_pose);
-
-    static bool minimized = false;
-    bool was_minimized = minimized;
-    if (ui_button(minimized ? "Open" : "Close")) {
-        minimized = !minimized;
+        return original_varjo_WaitSync(session, frameInfo);
     }
 
-    // Refresh the list of available windows.
-    static int countdown = 0;
-    if ((!minimized && was_minimized) || --countdown <= 0) {
-        available_windows.clear();
-
-        EnumWindows(
-            [](HWND hwnd, LPARAM) {
-                if (hwnd == nullptr)
-                    return TRUE;
-                if (hwnd == GetShellWindow())
-                    return TRUE;
-                if (!IsWindowVisible(hwnd))
-                    return TRUE;
-                if (GetAncestor(hwnd, GA_ROOT) != hwnd)
-                    return TRUE;
-
-                LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-                if (style & WS_DISABLED)
-                    return TRUE;
-
-                char text[256];
-                GetWindowText(hwnd, text, sizeof(text));
-                if (strcmp(text, "") == 0)
-                    return TRUE;
-
-                available_window_t win = {};
-                win.window = hwnd;
-                strncpy(win.name, text, sizeof(win.name));
-                for (size_t j = 0; j < mirror_windows.size(); j++) {
-                    if (mirror_windows[j].window == hwnd) {
-                        win.mirrored = win.was_mirrored = true;
-                        break;
-                    }
-                }
-                available_windows.push_back(win);
-
-                return TRUE;
-            },
-            0);
-
-        countdown = 500;
-    }
-
-    if (!minimized) {
-        // Draw the toggles.
-        for (size_t i = 0; i < available_windows.size(); i++) {
-            ui_toggle(available_windows[i].name, available_windows[i].mirrored);
-
-            // Detect toggling a window on/off.
-            if (available_windows[i].mirrored != available_windows[i].was_mirrored) {
-                size_t j = 0;
-                for (; j < mirror_windows.size(); j++) {
-                    if (mirror_windows[j].window == available_windows[i].window) {
-                        break;
-                    }
-                }
-
-                if (available_windows[i].mirrored && j == mirror_windows.size()) {
-                    window_t win = {};
-                    win.window = available_windows[i].window;
-                    strncpy(win.name, available_windows[i].name, sizeof(win.name));
-                    win.pose =
-                        pose_t{{0, 0, -0.5f + 0.001f * mirror_windows.size()}, quat_lookat(vec3_zero, {0, 0, 1})};
-                    win.scale = 0.5f;
-                    win.decorate = true;
-                    mirror_windows.push_back(win);
-                } else if (!available_windows[i].mirrored && j != mirror_windows.size()) {
-                    material_release(mirror_windows[j].material);
-                    if (mirror_windows[j].shared_texture) {
-                        mirror_windows[j].shared_texture->Release();
-                    }
-                    tex_release(mirror_windows[j].texture);
-                    mirror_windows.erase(mirror_windows.begin() + j);
-                }
-            }
-            available_windows[i].was_mirrored = available_windows[i].mirrored;
-        }
-    }
-
-    ui_window_end();
-
-    for (size_t i = 0; i < mirror_windows.size(); i++) {
-        // Create resources for the window.
-        if (!mirror_windows[i].texture) {
-            HANDLE surface = nullptr;
-            LUID luid = {
-                0,
-            };
-            ULONG format = 0;
-            ULONG flags = 0;
-            ULONGLONG update_id = 0;
-            if (!DwmGetDxSharedSurface(mirror_windows[i].window, &surface, &luid, &format, &flags, &update_id)) {
-                log_warn("Failed to get surface!");
-                continue;
+    struct SKOverlay {
+        struct Window {
+            ~Window() {
+                material_release(material);
+                tex_release(texture);
             }
 
-            ID3D11Texture2D* shared_tex = nullptr;
-            if (FAILED(mirror_device->OpenSharedResource(surface, __uuidof(ID3D11Texture2D), (void**)(&shared_tex)))) {
-                log_warn("Failed to get shared surface!");
-                continue;
+            HWND window = nullptr;
+            std::string title;
+            ComPtr<ID3D11Texture2D> sharedTexture;
+            tex_t texture = nullptr;
+            material_t material = nullptr;
+            pose_t pose = {};
+            float scale = 0.75f;
+            bool32_t decorate = true;
+            bool32_t minimized = false;
+        };
+
+        struct AvailableWindow {
+            HWND window = nullptr;
+            std::string title;
+            bool32_t mirrored = false;
+            bool32_t wasMirrored = false;
+        };
+
+        SKOverlay() {
+            ComPtr<ID3D11DeviceContext> context;
+            render_get_device(reinterpret_cast<void**>(m_device.GetAddressOf()),
+                              reinterpret_cast<void**>(context.GetAddressOf()));
+
+            m_quadMesh = mesh_find(default_id_mesh_quad);
+        }
+
+        void refreshAvailableWindows(bool forceRefresh) {
+            static int countdown = 0;
+            if (forceRefresh || --countdown <= 0) {
+                m_availableWindows.clear();
+
+                EnumWindows(
+                    [](HWND hwnd, LPARAM lParam) {
+                        SKOverlay* overlay = reinterpret_cast<SKOverlay*>(lParam);
+
+                        if (hwnd == nullptr)
+                            return TRUE;
+                        if (hwnd == GetShellWindow())
+                            return TRUE;
+                        if (!IsWindowVisible(hwnd))
+                            return TRUE;
+                        if (GetAncestor(hwnd, GA_ROOT) != hwnd)
+                            return TRUE;
+
+                        LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+                        if (style & WS_DISABLED)
+                            return TRUE;
+
+                        char text[256];
+                        GetWindowText(hwnd, text, sizeof(text));
+                        if (strcmp(text, "") == 0)
+                            return TRUE;
+
+                        AvailableWindow availableWindow;
+                        availableWindow.window = hwnd;
+                        availableWindow.title = text;
+                        for (const auto& window : overlay->m_windows) {
+                            if (window.window == hwnd) {
+                                availableWindow.mirrored = availableWindow.wasMirrored = true;
+                                break;
+                            }
+                        }
+                        overlay->m_availableWindows.push_back(std::move(availableWindow));
+
+                        return TRUE;
+                    },
+                    reinterpret_cast<LPARAM>(this));
+
+                countdown = 500;
+            }
+        }
+
+        void handleAvailableWindowsList() {
+            for (auto& availableWindow : m_availableWindows) {
+                // Draw the toggles.
+                ui_toggle(availableWindow.title.c_str(), availableWindow.mirrored);
+
+                // Detect toggling a window on/off.
+                if (availableWindow.mirrored != availableWindow.wasMirrored) {
+                    auto it = m_windows.begin();
+                    for (; it != m_windows.end(); it++) {
+                        if (it->window == availableWindow.window) {
+                            break;
+                        }
+                    }
+
+                    if (availableWindow.mirrored && it == m_windows.end()) {
+                        Window newWindow = {};
+                        newWindow.window = availableWindow.window;
+                        newWindow.title = availableWindow.title;
+                        newWindow.pose =
+                            pose_t{{0, 0, -0.5f + 0.001f * (rand() % 20)}, quat_lookat(vec3_zero, {0, 0, 1})};
+                        m_windows.push_back(newWindow);
+                    } else if (!availableWindow.mirrored && it != m_windows.end()) {
+                        m_windows.erase(it);
+                    }
+                }
+                availableWindow.wasMirrored = availableWindow.mirrored;
+            }
+        }
+
+        void ensureWindowResources(Window& window) {
+            if (!window.texture) {
+                HANDLE surface = nullptr;
+                LUID luid = {
+                    0,
+                };
+                ULONG format = 0;
+                ULONG flags = 0;
+                ULONGLONG update_id = 0;
+                if (!DwmGetDxSharedSurface(window.window, &surface, &luid, &format, &flags, &update_id)) {
+                    log_warn("Failed to get surface!");
+                    return;
+                }
+
+                ComPtr<ID3D11Texture2D> sharedTexture = nullptr;
+                if (FAILED(m_device->OpenSharedResource(surface, IID_PPV_ARGS(sharedTexture.GetAddressOf())))) {
+                    log_warn("Failed to get shared surface!");
+                    return;
+                }
+
+                window.material = material_copy_id(default_id_material_unlit);
+                window.sharedTexture = sharedTexture;
+                window.texture = tex_create();
+                tex_set_surface(window.texture, sharedTexture.Get(), tex_type_image_nomips, format, 0, 0, 1);
+                tex_set_address(window.texture, tex_address_clamp);
+                material_set_texture(window.material, "diffuse", window.texture);
+            }
+        }
+
+        void drawWindows() {
+            for (auto& window : m_windows) {
+                ensureWindowResources(window);
+
+                // Draw the window.
+                ui_window_begin(
+                    window.title.c_str(), window.pose, vec2_zero, window.decorate ? ui_win_head : ui_win_empty);
+
+                if (!window.minimized) {
+                    vec2 size = vec2{(float)tex_get_width(window.texture), (float)tex_get_height(window.texture)} *
+                                0.0004f * window.scale;
+                    ui_layout_reserve(size);
+
+                    render_add_mesh(m_quadMesh,
+                                    window.material,
+                                    matrix_trs(vec3{0, -size.y / 2, 0}, quat_identity, vec3{size.x, size.y, 1}));
+
+                    if (ui_button("+")) {
+                        window.scale *= 1.1f;
+                    }
+                    ui_sameline();
+                    if (ui_button("-")) {
+                        window.scale *= 0.9f;
+                    }
+                    ui_sameline();
+                }
+
+                if (ui_button(window.decorate ? "Hide title" : "Show title")) {
+                    window.decorate = !window.decorate;
+                }
+                ui_sameline();
+
+                if (ui_button(window.minimized ? "Show" : "Minimize")) {
+                    window.minimized = !window.minimized;
+                }
+
+                ui_window_end();
+            }
+        }
+
+        void step(void) {
+            ui_window_begin("Window Selection", m_menuPose);
+
+            bool wasMinimized = m_minimized;
+            if (ui_button(m_minimized ? "Open" : "Close")) {
+                m_minimized = !m_minimized;
             }
 
-            mirror_windows[i].material = material_copy_id(default_id_material_unlit);
-            mirror_windows[i].shared_texture = shared_tex;
-            mirror_windows[i].texture = tex_create();
-            tex_set_surface(mirror_windows[i].texture, shared_tex, tex_type_image_nomips, format, 0, 0, 1);
-            tex_set_address(mirror_windows[i].texture, tex_address_clamp);
-            material_set_texture(mirror_windows[i].material, "diffuse", mirror_windows[i].texture);
+            refreshAvailableWindows(!m_minimized && wasMinimized);
+
+            if (!m_minimized) {
+                handleAvailableWindowsList();
+            }
+
+            ui_window_end();
+
+            drawWindows();
         }
 
-        // Draw the window.
-        ui_window_begin(mirror_windows[i].name,
-                        mirror_windows[i].pose,
-                        vec2_zero,
-                        mirror_windows[i].decorate ? ui_win_head : ui_win_empty);
-
-        vec2 size =
-            vec2{(float)tex_get_width(mirror_windows[i].texture), (float)tex_get_height(mirror_windows[i].texture)} *
-            0.0004f * mirror_windows[i].scale;
-        ui_layout_reserve(size);
-
-        render_add_mesh(mirror_mesh,
-                        mirror_windows[i].material,
-                        matrix_trs(vec3{0, -size.y / 2, 0}, quat_identity, vec3{size.x, size.y, 1}));
-
-        if (ui_button("+")) {
-            mirror_windows[i].scale *= 1.1f;
-        }
-        ui_sameline();
-        if (ui_button("-")) {
-            mirror_windows[i].scale *= 0.9f;
+        void run() {
+            sk_run_data(
+                [](void* opaque) {
+                    SKOverlay* overlay = reinterpret_cast<SKOverlay*>(opaque);
+                    overlay->step();
+                },
+                this,
+                nullptr,
+                this);
         }
 
-        if (ui_button(mirror_windows[i].decorate ? "Hide title" : "Show title")) {
-            mirror_windows[i].decorate = !mirror_windows[i].decorate;
-        }
+        bool m_minimized = false;
+        pose_t m_menuPose = pose_t{{0, 0, -0.5f}, quat_lookat(vec3_zero, {0, 0, 1})};
 
-        ui_window_end();
-    }
-}
+        mesh_t m_quadMesh;
+        ComPtr<ID3D11Device> m_device;
+
+        std::vector<Window> m_windows;
+        std::vector<AvailableWindow> m_availableWindows;
+    };
+
+} // namespace
 
 int main(void) {
     DetourRestoreAfterWith();
@@ -249,17 +298,11 @@ int main(void) {
     // Disable skybox to ensure a transparent background.
     render_enable_skytex(false);
 
-    // Resources for the scene.
-    mirror_mesh = mesh_find(default_id_mesh_quad);
-    ID3D11DeviceContext* context;
-    render_get_device((void**)&mirror_device, (void**)&context);
-    if (context) {
-        context->Release();
-    }
+    DwmGetDxSharedSurface =
+        (decltype(DwmGetDxSharedSurface))GetProcAddress(LoadLibrary("user32.dll"), "DwmGetDxSharedSurface");
 
-    DwmGetDxSharedSurface = (fn_GetDxSharedSurface)GetProcAddress(LoadLibrary("user32.dll"), "DwmGetDxSharedSurface");
-
-    sk_run(step);
+    SKOverlay overlay;
+    overlay.run();
 
     return 0;
 }
