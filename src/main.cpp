@@ -32,8 +32,15 @@ using Microsoft::WRL::ComPtr;
 #include <Varjo.h>
 #include <detours.h>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include <winrt/base.h>
+#include <winrt/windows.foundation.h>
+#include <winrt/windows.graphics.capture.h>
+#include <windows.graphics.capture.interop.h>
+#include <winrt/windows.graphics.directx.direct3d11.h>
 
 #include <stereokit.h>
 #include <stereokit_ui.h>
@@ -43,15 +50,6 @@ using namespace sk;
 
 namespace {
 
-    // TODO: Replace me with WinRT Capture.
-    BOOL(WINAPI* DwmGetDxSharedSurface)
-    (HANDLE hHandle,
-     HANDLE* phSurface,
-     LUID* pAdapterLuid,
-     ULONG* pFmtWindow,
-     ULONG* pPresentFlags,
-     ULONGLONG* pWin32kUpdateId) = nullptr;
-
     // Hook the Varjo SDK (used by the OpenXR runtime) to keep the session as an overlay.
     void (*original_varjo_WaitSync)(struct varjo_Session* session, struct varjo_FrameInfo* frameInfo) = nullptr;
     void hooked_varjo_WaitSync(struct varjo_Session* session, struct varjo_FrameInfo* frameInfo) {
@@ -60,15 +58,100 @@ namespace {
         return original_varjo_WaitSync(session, frameInfo);
     }
 
-    struct SKOverlay {
-        struct Window {
-            ~Window() {
-                material_release(material);
-                tex_release(texture);
+    // Alternative to windows.graphics.directx.direct3d11.interop.h
+    extern "C" {
+    HRESULT __stdcall CreateDirect3D11DeviceFromDXGIDevice(::IDXGIDevice* dxgiDevice, ::IInspectable** graphicsDevice);
+
+    HRESULT __stdcall CreateDirect3D11SurfaceFromDXGISurface(::IDXGISurface* dgxiSurface,
+                                                             ::IInspectable** graphicsSurface);
+    }
+
+    // https://gist.github.com/kennykerr/15a62c8218254bc908de672e5ed405fa
+    struct __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")) IDirect3DDXGIInterfaceAccess : ::IUnknown {
+        virtual HRESULT __stdcall GetInterface(GUID const& id, void** object) = 0;
+    };
+
+    // Helper for WinRT window capture.
+    class CaptureWindow {
+      public:
+        CaptureWindow(ID3D11Device* device, HWND window) {
+            auto interop_factory = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+                                                                 IGraphicsCaptureItemInterop>();
+            winrt::check_hresult(interop_factory->CreateForWindow(
+                window,
+                winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+                winrt::put_abi(m_item)));
+
+            initialize(device);
+        }
+
+        CaptureWindow(ID3D11Device* device, HMONITOR monitor) {
+            auto interop_factory = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+                                                                 IGraphicsCaptureItemInterop>();
+            winrt::check_hresult(interop_factory->CreateForMonitor(
+                monitor,
+                winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+                winrt::put_abi(m_item)));
+
+            initialize(device);
+        }
+
+        ~CaptureWindow() {
+            m_session.Close();
+            m_framePool.Close();
+        }
+
+        ID3D11Texture2D* getSurface() const {
+            auto frame = m_framePool.TryGetNextFrame();
+            if (frame != nullptr) {
+                ComPtr<ID3D11Texture2D> surface;
+                auto access = frame.Surface().as<IDirect3DDXGIInterfaceAccess>();
+                winrt::check_hresult(access->GetInterface(winrt::guid_of<ID3D11Texture2D>(),
+                                                          reinterpret_cast<void**>(surface.ReleaseAndGetAddressOf())));
+
+                m_lastCapturedFrame = frame;
+                m_lastCapturedSurface = surface;
             }
 
+            return m_lastCapturedSurface.Get();
+        }
+
+        std::pair<int32_t, int32_t> getSize() const {
+            return {m_item.Size().Width, m_item.Size().Height};
+        }
+
+      private:
+        void initialize(ID3D11Device* device) {
+            ComPtr<IDXGIDevice> dxgiDevice;
+            winrt::check_hresult(device->QueryInterface(IID_PPV_ARGS(dxgiDevice.ReleaseAndGetAddressOf())));
+            ComPtr<IInspectable> object;
+            winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.Get(), object.GetAddressOf()));
+            winrt::check_hresult(
+                object->QueryInterface(winrt::guid_of<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>(),
+                                       winrt::put_abi(m_interopDevice)));
+
+            m_framePool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+                m_interopDevice,
+                static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(DXGI_FORMAT_R8G8B8A8_UNORM),
+                2,
+                m_item.Size());
+            m_session = m_framePool.CreateCaptureSession(m_item);
+            m_session.StartCapture();
+        }
+
+        winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_interopDevice;
+        winrt::Windows::Graphics::Capture::GraphicsCaptureItem m_item{nullptr};
+        winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool m_framePool{nullptr};
+        winrt::Windows::Graphics::Capture::GraphicsCaptureSession m_session{nullptr};
+        mutable winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame m_lastCapturedFrame{nullptr};
+        mutable ComPtr<ID3D11Texture2D> m_lastCapturedSurface;
+    };
+
+    struct SKOverlay {
+        struct Window {
             HWND window = nullptr;
             std::string title;
+            std::shared_ptr<CaptureWindow> captureWindow;
             ComPtr<ID3D11Texture2D> sharedTexture;
             tex_t texture = nullptr;
             material_t material = nullptr;
@@ -161,6 +244,8 @@ namespace {
                             pose_t{{0, 0, -0.5f + 0.001f * (rand() % 20)}, quat_lookat(vec3_zero, {0, 0, 1})};
                         m_windows.push_back(newWindow);
                     } else if (!availableWindow.mirrored && it != m_windows.end()) {
+                        material_release(it->material);
+                        tex_release(it->texture);
                         m_windows.erase(it);
                     }
                 }
@@ -170,28 +255,13 @@ namespace {
 
         void ensureWindowResources(Window& window) {
             if (!window.texture) {
-                HANDLE surface = nullptr;
-                LUID luid = {
-                    0,
-                };
-                ULONG format = 0;
-                ULONG flags = 0;
-                ULONGLONG update_id = 0;
-                if (!DwmGetDxSharedSurface(window.window, &surface, &luid, &format, &flags, &update_id)) {
-                    log_warn("Failed to get surface!");
-                    return;
+                try {
+                    window.captureWindow = std::make_shared<CaptureWindow>(m_device.Get(), window.window);
+                } catch (...) {
+                    log_warn("Failed to open window capture");
                 }
-
-                ComPtr<ID3D11Texture2D> sharedTexture = nullptr;
-                if (FAILED(m_device->OpenSharedResource(surface, IID_PPV_ARGS(sharedTexture.GetAddressOf())))) {
-                    log_warn("Failed to get shared surface!");
-                    return;
-                }
-
                 window.material = material_copy_id(default_id_material_unlit);
-                window.sharedTexture = sharedTexture;
                 window.texture = tex_create();
-                tex_set_surface(window.texture, sharedTexture.Get(), tex_type_image_nomips, format, 0, 0, 1);
                 tex_set_address(window.texture, tex_address_clamp);
                 material_set_texture(window.material, "diffuse", window.texture);
             }
@@ -206,13 +276,34 @@ namespace {
                     window.title.c_str(), window.pose, vec2_zero, window.decorate ? ui_win_head : ui_win_empty);
 
                 if (!window.minimized) {
-                    vec2 size = vec2{(float)tex_get_width(window.texture), (float)tex_get_height(window.texture)} *
-                                0.0004f * window.scale;
-                    ui_layout_reserve(size);
+                    std::pair<int32_t, int32_t> size;
+                    if (window.captureWindow) {
+                        window.sharedTexture = window.captureWindow->getSurface();
+                        if (window.sharedTexture) {
+                            D3D11_TEXTURE2D_DESC desc{};
+                            window.sharedTexture->GetDesc(&desc);
 
-                    render_add_mesh(m_quadMesh,
-                                    window.material,
-                                    matrix_trs(vec3{0, -size.y / 2, 0}, quat_identity, vec3{size.x, size.y, 1}));
+                            tex_set_surface(window.texture,
+                                            window.sharedTexture.Get(),
+                                            tex_type_image_nomips,
+                                            desc.Format,
+                                            0,
+                                            0,
+                                            1);
+                        }
+                        size = window.captureWindow->getSize();
+                    }
+
+                    vec2 scaledSize =
+                        vec2{window.captureWindow ? (float)size.first : (float)tex_get_width(window.texture),
+                             window.captureWindow ? (float)size.second : (float)tex_get_height(window.texture)} *
+                        0.0004f * window.scale;
+                    ui_layout_reserve(scaledSize);
+
+                    render_add_mesh(
+                        m_quadMesh,
+                        window.material,
+                        matrix_trs(vec3{0, -scaledSize.y / 2, 0}, quat_identity, vec3{scaledSize.x, scaledSize.y, 1}));
 
                     if (ui_button("+")) {
                         window.scale *= 1.1f;
@@ -298,9 +389,6 @@ int main(void) {
 
     // Disable skybox to ensure a transparent background.
     render_enable_skytex(false);
-
-    DwmGetDxSharedSurface =
-        (decltype(DwmGetDxSharedSurface))GetProcAddress(LoadLibrary("user32.dll"), "DwmGetDxSharedSurface");
 
     SKOverlay overlay;
     overlay.run();
