@@ -33,6 +33,7 @@ using Microsoft::WRL::ComPtr;
 #include <detours.h>
 #include <filesystem>
 #include <memory>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -241,6 +242,12 @@ namespace {
                                 break;
                             }
                         }
+                        // Open the windows that matched filters.
+                        for (const auto& filter : overlay->m_filters) {
+                            if (std::regex_search(availableWindow.title, filter)) {
+                                availableWindow.mirrored = true;
+                            }
+                        }
                         overlay->m_availableWindows.push_back(std::move(availableWindow));
 
                         return TRUE;
@@ -417,8 +424,15 @@ namespace {
                 this);
         }
 
+        void addFilter(const std::string& expression) {
+            if (expression.empty()) {
+                return;
+            }
+            m_filters.push_back(std::regex(expression, std::regex_constants::ECMAScript | std::regex_constants::icase));
+        }
+
         bool m_minimized = false;
-        pose_t m_menuPose = pose_t{{0, 0, -0.5f}, quat_lookat(vec3_zero, {0, 0, 1})};
+        pose_t m_menuPose = pose_t{{0.35f, 0, -0.35f}, quat_lookat({0.35f, 0, -0.35f}, {0, 0, 0})};
 
         mesh_t m_quadMesh;
         ComPtr<ID3D11Device> m_device;
@@ -426,12 +440,13 @@ namespace {
         std::vector<Window> m_windows;
         std::vector<AvailableWindow> m_availableMonitors;
         std::vector<AvailableWindow> m_availableWindows;
+
+        std::vector<std::regex> m_filters;
     };
 
 } // namespace
 
-// TODO: Use command line for initial window filtering.
-int main(void) {
+int main(int argc, char** argv) {
     DetourRestoreAfterWith();
 
     sk_settings_t settings = {};
@@ -452,6 +467,9 @@ int main(void) {
     render_enable_skytex(false);
 
     SKOverlay overlay;
+    for (int i = 1; i < argc; i++) {
+        overlay.addFilter(argv[i]);
+    }
     overlay.run();
 
     return 0;
