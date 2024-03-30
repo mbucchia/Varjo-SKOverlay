@@ -150,6 +150,7 @@ namespace {
     struct SKOverlay {
         struct Window {
             HWND window = nullptr;
+            HMONITOR monitor = nullptr;
             std::string title;
             std::shared_ptr<CaptureWindow> captureWindow;
             ComPtr<ID3D11Texture2D> sharedTexture;
@@ -159,10 +160,12 @@ namespace {
             float scale = 0.75f;
             bool32_t decorate = true;
             bool32_t minimized = false;
+            bool cleanup = false;
         };
 
         struct AvailableWindow {
             HWND window = nullptr;
+            HMONITOR monitor = nullptr;
             std::string title;
             bool32_t mirrored = false;
             bool32_t wasMirrored = false;
@@ -174,6 +177,32 @@ namespace {
                               reinterpret_cast<void**>(context.GetAddressOf()));
 
             m_quadMesh = mesh_find(default_id_mesh_quad);
+
+            initializeAvailableMonitors();
+        }
+
+        void initializeAvailableMonitors() {
+            m_availableMonitors.clear();
+
+            EnumDisplayMonitors(
+                nullptr,
+                nullptr,
+                [](HMONITOR monitor, HDC hdc, LPRECT rect, LPARAM lParam) {
+                    SKOverlay* overlay = reinterpret_cast<SKOverlay*>(lParam);
+
+                    MONITORINFOEX monitorInfo{};
+                    monitorInfo.cbSize = sizeof(monitorInfo);
+                    if (GetMonitorInfo(monitor, &monitorInfo)) {
+                        AvailableWindow availableMonitor;
+                        availableMonitor.monitor = monitor;
+                        availableMonitor.title = "Monitor ";
+                        availableMonitor.title += std::string(monitorInfo.szDevice);
+                        overlay->m_availableMonitors.push_back(std::move(availableMonitor));
+                    }
+
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(this));
         }
 
         void refreshAvailableWindows(bool forceRefresh) {
@@ -222,8 +251,8 @@ namespace {
             }
         }
 
-        void handleAvailableWindowsList() {
-            for (auto& availableWindow : m_availableWindows) {
+        void handleAvailableWindowsList(std::vector<AvailableWindow>& availableWindows) {
+            for (auto& availableWindow : availableWindows) {
                 // Draw the toggles.
                 ui_toggle(availableWindow.title.c_str(), availableWindow.mirrored);
 
@@ -231,7 +260,10 @@ namespace {
                 if (availableWindow.mirrored != availableWindow.wasMirrored) {
                     auto it = m_windows.begin();
                     for (; it != m_windows.end(); it++) {
-                        if (it->window == availableWindow.window) {
+                        if (it->window && it->window == availableWindow.window) {
+                            break;
+                        }
+                        if (it->monitor && it->monitor == availableWindow.monitor) {
                             break;
                         }
                     }
@@ -239,6 +271,7 @@ namespace {
                     if (availableWindow.mirrored && it == m_windows.end()) {
                         Window newWindow = {};
                         newWindow.window = availableWindow.window;
+                        newWindow.monitor = availableWindow.monitor;
                         newWindow.title = availableWindow.title;
                         newWindow.pose =
                             pose_t{{0, 0, -0.5f + 0.001f * (rand() % 20)}, quat_lookat(vec3_zero, {0, 0, 1})};
@@ -254,9 +287,18 @@ namespace {
         }
 
         void ensureWindowResources(Window& window) {
+            if (window.window && !IsWindow(window.window)) {
+                window.cleanup = true;
+                return;
+            }
+
             if (!window.texture) {
                 try {
-                    window.captureWindow = std::make_shared<CaptureWindow>(m_device.Get(), window.window);
+                    if (window.window) {
+                        window.captureWindow = std::make_shared<CaptureWindow>(m_device.Get(), window.window);
+                    } else {
+                        window.captureWindow = std::make_shared<CaptureWindow>(m_device.Get(), window.monitor);
+                    }
                 } catch (...) {
                     log_warn("Failed to open window capture");
                 }
@@ -268,12 +310,24 @@ namespace {
         }
 
         void drawWindows() {
-            for (auto& window : m_windows) {
+            auto it = m_windows.begin();
+            while (it != m_windows.end()) {
+                auto& window = *it;
+
                 ensureWindowResources(window);
+                if (window.cleanup) {
+                    material_release(it->material);
+                    tex_release(it->texture);
+                    it = m_windows.erase(it);
+                    continue;
+                }
 
                 // Draw the window.
-                ui_window_begin(
-                    window.title.c_str(), window.pose, vec2_zero, window.decorate ? ui_win_head : ui_win_empty);
+                ui_window_begin(window.title.c_str(),
+                                window.pose,
+                                vec2_zero,
+                                window.decorate ? ui_win_head : ui_win_empty,
+                                sk::ui_move_exact);
 
                 if (!window.minimized) {
                     std::pair<int32_t, int32_t> size;
@@ -325,11 +379,13 @@ namespace {
                 }
 
                 ui_window_end();
+
+                it++;
             }
         }
 
         void step(void) {
-            ui_window_begin("Window Selection", m_menuPose);
+            ui_window_begin("Window Selection", m_menuPose, vec2{0, 0}, sk::ui_win_normal, sk::ui_move_exact);
 
             bool wasMinimized = m_minimized;
             if (ui_button(m_minimized ? "Open" : "Close")) {
@@ -339,7 +395,10 @@ namespace {
             refreshAvailableWindows(!m_minimized && wasMinimized);
 
             if (!m_minimized) {
-                handleAvailableWindowsList();
+                ui_hseparator();
+                handleAvailableWindowsList(m_availableMonitors);
+                ui_hseparator();
+                handleAvailableWindowsList(m_availableWindows);
             }
 
             ui_window_end();
@@ -365,11 +424,13 @@ namespace {
         ComPtr<ID3D11Device> m_device;
 
         std::vector<Window> m_windows;
+        std::vector<AvailableWindow> m_availableMonitors;
         std::vector<AvailableWindow> m_availableWindows;
     };
 
 } // namespace
 
+// TODO: Use command line for initial window filtering.
 int main(void) {
     DetourRestoreAfterWith();
 
