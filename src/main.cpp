@@ -398,6 +398,12 @@ namespace {
             if (ui_button(m_minimized ? "Open" : "Close")) {
                 m_minimized = !m_minimized;
             }
+            ui_sameline();
+            if (ui_button(m_handsVisible ? "Hide hands" : "Show hands")) {
+                m_handsVisible = !m_handsVisible;
+                input_hand_visible(sk::handed_left, m_handsVisible);
+                input_hand_visible(sk::handed_right, m_handsVisible);
+            }
 
             refreshAvailableWindows(!m_minimized && wasMinimized);
 
@@ -436,6 +442,8 @@ namespace {
 
         mesh_t m_quadMesh;
         ComPtr<ID3D11Device> m_device;
+
+        bool m_handsVisible = true;
 
         std::vector<Window> m_windows;
         std::vector<AvailableWindow> m_availableMonitors;
